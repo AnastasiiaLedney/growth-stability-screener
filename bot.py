@@ -4,63 +4,87 @@ import pandas as pd
 import yfinance as yf
 import requests
 
+# Nastavení
 BUDGET = 10_000
-UNIVERSE = ["AAPL","MSFT","GOOGL","AMZN","TSLA","META","NVDA","JPM","V","MA",
-            "PG","KO","PEP","COST","WMT","XOM","CVX","JNJ","ABBV","MRK",
-            "SPY","VOO","QQQ","DIA"]
+UNIVERSE = [
+    "AAPL","MSFT","GOOGL","AMZN","TSLA","META","NVDA","JPM","V","MA",
+    "PG","KO","PEP","COST","WMT","XOM","CVX","JNJ","ABBV","MRK",
+    "SPY","VOO","QQQ","DIA","SCHD","IWM"
+]
+
+def get_rsi(series, period=14):
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).ewm(alpha=1/period, adjust=False).mean()
+    loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/period, adjust=False).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
 
 def main():
-    # Session proti blokování
+    # 1. Ošetření blokování (User-Agent)
     session = requests.Session()
-    session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/110.0.0.0'})
+    session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
     
-    rows = []
-    print(f"Skenuji {len(UNIVERSE)} titulů...")
+    results = []
 
-    for t in UNIVERSE:
+    print(f"Spouštím skener pro {len(UNIVERSE)} titulů...")
+
+    for ticker in UNIVERSE:
         try:
-            # multi_level_index=False zajistí, že hist['Close'] bude fungovat
-            hist = yf.download(t, period="18mo", interval="1d", auto_adjust=True, 
-                               progress=False, multi_level_index=False, session=session)
+            # 2. KLÍČOVÁ OPRAVA: multi_level_index=False
+            df = yf.download(ticker, period="18mo", interval="1d", 
+                             auto_adjust=True, progress=False, 
+                             multi_level_index=False, session=session)
             
-            if hist.empty or len(hist) < 200: continue
+            if df.empty or len(df) < 201:
+                continue
 
-            price = float(hist["Close"].iloc[-1])
-            sma200 = hist["Close"].rolling(200).mean().iloc[-1]
+            # Výpočty
+            close_prices = df["Close"]
+            current_price = float(close_prices.iloc[-1])
+            sma200 = close_prices.rolling(200).mean().iloc[-1]
+            rsi = get_rsi(close_prices).iloc[-1]
             
-            # --- UVOLNĚNÉ FILTRY ---
-            # 1. Cena: do 1000 USD (aby prošel i Microsoft/Apple/Costco)
-            if not (10 <= price <= 1000): continue
+            # 3. FILTRY (nastaveny tak, aby v roce 2026 něco našly)
+            # Cena 20 - 800 USD
+            if not (20 <= current_price <= 800):
+                continue
             
-            # 2. Nad SMA200: Musí být v trendu
-            if price < sma200: continue
+            # Musí být nad SMA200 (rostoucí trend)
+            if current_price < sma200:
+                continue
             
-            # 3. RSI: Rozšířeno na 30-75 (aby prošly i rostoucí akcie)
-            delta = hist["Close"].diff()
-            gain = delta.clip(lower=0).ewm(alpha=1/14).mean()
-            loss = -delta.clip(upper=0).ewm(alpha=1/14).mean()
-            rsi = 100 - (100 / (1 + (gain / loss))).iloc[-1]
-            if not (30 <= rsi <= 75): continue
+            # RSI 30 - 70 (zdravý trend, ne extrémně překoupeno)
+            if not (30 <= rsi <= 70):
+                continue
 
-            # Pokud projde, přidáme do seznamu
-            rows.append({
-                "Ticker": t,
-                "Cena": round(price, 2),
-                "RSI": round(rsi, 1),
-                "Nad_SMA200": "Ano"
+            # Pokud prošel filtry, přidáme data
+            results.append({
+                "Ticker": ticker,
+                "Price": round(current_price, 2),
+                "SMA200": round(sma200, 2),
+                "RSI": round(rsi, 2),
+                "Status": "Koupit"
             })
-            print(f"Nalezeno: {t}")
+            print(f"✅ {ticker} vyhovuje.")
 
         except Exception as e:
-            print(f"Chyba u {t}: {e}")
+            print(f"❌ Chyba u {ticker}: {e}")
 
-    df = pd.DataFrame(rows)
-    if df.empty:
-        # Pokud je stále prázdno, vytvoříme aspoň info řádek
-        df = pd.DataFrame([{"Zpráva": "Žádná akcie nesplnila filtry"}])
+    # 4. Uložení výsledků
+    final_df = pd.DataFrame(results)
     
-    df.to_csv("candidates.csv", index=False)
-    print("Hotovo. Výsledky v candidates.csv")
+    if final_df.empty:
+        final_df = pd.DataFrame([{"Zpráva": "Dnes žádná akcie nesplnila filtry (zkuste uvolnit RSI nebo cenu)."}])
+        print("Nebyla nalezena žádná vhodná akcie.")
+    else:
+        # Výpočet alokace
+        num_stocks = len(final_df)
+        alloc = BUDGET / num_stocks
+        final_df["Alloc_USD"] = round(alloc, 2)
+        final_df["Shares"] = (alloc / final_df["Price"]).apply(math.floor)
+
+    final_df.to_csv("candidates.csv", index=False)
+    print("Soubor candidates.csv byl vytvořen.")
 
 if __name__ == "__main__":
     main()
