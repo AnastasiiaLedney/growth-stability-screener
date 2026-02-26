@@ -1,15 +1,16 @@
-name: growth-stability-screener
+name: Growth-Stability Screener
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 14 * * 1-5"  # Po–Pá 14:00 UTC
+    - cron: "0 7 * * 1-5"   # Po–Pá v 07:00 UTC
 
 jobs:
-  run:
+  run-screener:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -22,9 +23,6 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run bot
-        env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python bot.py
 
