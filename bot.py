@@ -1,34 +1,21 @@
-import os
-import requests
-import pandas as pd
+import math
 import numpy as np
+import pandas as pd
 import yfinance as yf
 
-# ----------------------------
-# 1) UNIVERSE (blue-chip + ETF)
-# ----------------------------
-TICKERS = [
-    # Blue-chip (příklady; můžeš rozšířit)
-    "AAPL","MSFT","JPM","KO","PG","XOM","WMT","CVX","PEP","COST","MCD","HD","V","MA",
-    "UNH","ABBV","MRK","BAC","CSCO","ORCL","ADBE","CRM","NFLX","DIS",
+BUDGET = 10_000
+
+# “Blue-chip” + pár likvidních ETF (můžeš kdykoli rozšířit)
+UNIVERSE = [
+    # Blue-chips (příklady)
+    "AAPL","MSFT","JPM","KO","PG","XOM","JNJ","PEP","WMT","HD","UNH","V","MA","COST","ABBV","CRM","NFLX",
+    "ADBE","DIS","MCD","NKE","INTC","CSCO","QCOM","TXN","AMGN","TMO","LIN","NEE","ORCL","BAC","WFC","IBM",
+    "GE","CAT","DE","RTX","HON","SBUX","LOW","INTU","GS","MS","BLK","SCHW","C","CVX",
     # ETF
-    "SPY","VOO","QQQ","VTI","DIA","IWM","SCHD"
+    "SPY","VOO","QQQ","VTI","SCHD","IWM","DIA"
 ]
 
-# ----------------------------
-# 2) Tvoje filtry
-# ----------------------------
-PRICE_MIN, PRICE_MAX = 30, 150
-MCAP_MIN = 20_000_000_000      # 20B
-AVG_VOL_MIN = 1_000_000        # 1M (30denní průměr)
-RSI_MIN, RSI_MAX = 35, 55
-MAX_CANDIDATES = 5
-
-# (volitelné) Telegram
-TG_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
-def rsi(close: pd.Series, period: int = 14) -> pd.Series:
+def rsi14(close: pd.Series, period: int = 14) -> pd.Series:
     delta = close.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
@@ -37,114 +24,176 @@ def rsi(close: pd.Series, period: int = 14) -> pd.Series:
     rs = avg_gain / avg_loss.replace(0, np.nan)
     return 100 - (100 / (1 + rs))
 
-def higher_highs_higher_lows(df: pd.DataFrame) -> bool:
-    # jednoduchá, praktická definice: posledních 20 dní má vyšší high i vyšší low než předchozích 20 dní
-    if len(df) < 60:
-        return False
-    h1 = df["High"].iloc[-20:].max()
-    h0 = df["High"].iloc[-40:-20].max()
-    l1 = df["Low"].iloc[-20:].min()
-    l0 = df["Low"].iloc[-40:-20].min()
-    return (h1 > h0) and (l1 > l0)
+def atr14(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        (high - low),
+        (high - prev_close).abs(),
+        (low - prev_close).abs()
+    ], axis=1).max(axis=1)
+    return tr.ewm(alpha=1/period, adjust=False).mean()
 
-def send_telegram(text: str):
-    if not TG_TOKEN or not TG_CHAT_ID:
-        print(text)
-        return
-    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": TG_CHAT_ID, "text": text}, timeout=20).raise_for_status()
+def higher_highs_higher_lows(data: pd.DataFrame, w: int = 20) -> bool:
+    # jednoduchá, ale použitelná definice:
+    # max posledních w dnů > max předchozích w dnů
+    # min posledních w dnů > min předchozích w dnů
+    if len(data) < 2*w:
+        return False
+    last = data.iloc[-w:]
+    prev = data.iloc[-2*w:-w]
+    return (last["High"].max() > prev["High"].max()) and (last["Low"].min() > prev["Low"].min())
+
+def safe_float(x):
+    try:
+        if x is None:
+            return np.nan
+        return float(x)
+    except Exception:
+        return np.nan
 
 def main():
     rows = []
-    for tkr in TICKERS:
-        try:
-            t = yf.Ticker(tkr)
 
-            # 1y data kvůli SMA200
-            df = t.history(period="1y", interval="1d", auto_adjust=True)
-            if df is None or df.empty or len(df) < 210:
+    for t in sorted(set(UNIVERSE)):
+        try:
+            hist = yf.download(t, period="18mo", interval="1d", auto_adjust=True, progress=False)
+            if hist is None or hist.empty or len(hist) < 210:
                 continue
 
-            df["SMA200"] = df["Close"].rolling(200).mean()
-            df["RSI14"] = rsi(df["Close"], 14)
-            df["AvgVol30"] = df["Volume"].rolling(30).mean()
+            hist["SMA200"] = hist["Close"].rolling(200).mean()
+            hist["EMA20"] = hist["Close"].ewm(span=20, adjust=False).mean()
+            hist["EMA50"] = hist["Close"].ewm(span=50, adjust=False).mean()
+            hist["RSI14"] = rsi14(hist["Close"], 14)
+            hist["ATR14"] = atr14(hist["High"], hist["Low"], hist["Close"], 14)
 
-            last = df.iloc[-1]
-            price = float(last["Close"])
-            sma200 = float(last["SMA200"])
-            rsi14 = float(last["RSI14"])
-            avgvol = float(last["AvgVol30"])
+            last = hist.iloc[-1]
+            price = safe_float(last["Close"])
+            sma200 = safe_float(last["SMA200"])
+            rsi = safe_float(last["RSI14"])
 
-            # market cap (Yahoo občas nevrátí; když nevrátí, ticker přeskočíme)
+            if np.isnan(price) or np.isnan(sma200) or np.isnan(rsi):
+                continue
+
+            # --- filtr price ---
+            if not (30 <= price <= 150):
+                continue
+
+            # --- základní “trend” filtry ---
+            above_sma200 = price > sma200
+            trend_confirmed = above_sma200 and (last["EMA20"] > last["EMA50"])
+
+            if not above_sma200:
+                continue
+
+            # --- RSI filtr ---
+            if not (35 <= rsi <= 55):
+                continue
+
+            # --- HH/HL filtr ---
+            hhhl = higher_highs_higher_lows(hist, w=20)
+            if not hhhl:
+                continue
+
+            # --- fundamentals / liquidity ---
             info = {}
             try:
-                info = t.fast_info
-                mcap = info.get("market_cap", None)
+                info = yf.Ticker(t).info or {}
             except Exception:
-                mcap = None
-            if mcap is None:
-                try:
-                    mcap = (t.info or {}).get("marketCap", None)
-                except Exception:
-                    mcap = None
-            if mcap is None:
+                info = {}
+
+            market_cap = safe_float(info.get("marketCap"))
+            total_assets = safe_float(info.get("totalAssets"))  # ETF proxy
+            avg_vol = safe_float(info.get("averageVolume")) or safe_float(info.get("averageVolume10days"))
+
+            # Market cap: akcie marketCap, ETF totalAssets
+            # (u ETF je “market cap” často prázdný)
+            effective_cap = market_cap
+            asset_type = "Stock"
+            if np.isnan(effective_cap) and not np.isnan(total_assets):
+                effective_cap = total_assets
+                asset_type = "ETF"
+
+            if np.isnan(effective_cap) or effective_cap < 20_000_000_000:
                 continue
 
-            # Filtry
-            if not (PRICE_MIN <= price <= PRICE_MAX):
-                continue
-            if mcap < MCAP_MIN:
-                continue
-            if avgvol < AVG_VOL_MIN:
-                continue
-            if not (price > sma200):
-                continue
-            if not (RSI_MIN <= rsi14 <= RSI_MAX):
-                continue
-            if not higher_highs_higher_lows(df):
+            if np.isnan(avg_vol) or avg_vol < 1_000_000:
                 continue
 
-            dist = (price - sma200) / sma200 * 100
+            # --- výpočty pro tabulku ---
+            dist_sma200_pct = (price - sma200) / sma200 * 100
 
-            # návrh vstupu/SL/Target (jednoduchý model – můžeš změnit)
-            entry = round(price, 2)
-            stop = round(price * 0.93, 2)     # -7%
-            target = round(price * 1.14, 2)   # +14%
-            rr = (target - entry) / (entry - stop) if (entry - stop) > 0 else np.nan
+            # entry = aktuální cena (můžeš změnit na limit pod close)
+            entry = price
 
+            # stop-loss: swing low za posledních 20 dnů mínus “polštář” 0.5*ATR
+            last20 = hist.iloc[-20:]
+            atr = safe_float(last["ATR14"])
+            swing_low = safe_float(last20["Low"].min())
+            stop = swing_low - (0.5 * atr if not np.isnan(atr) else 0)
+
+            # target: RR 2:1 (konzervativní default)
+            risk = max(entry - stop, 0.0001)
+            target = entry + 2 * risk
+            rr = (target - entry) / risk
+
+            # zatím vybereme “top” později řazením
+            name = info.get("shortName") or info.get("longName") or ""
             rows.append({
-                "Ticker": tkr,
-                "Price": round(price, 2),
-                "MarketCap": int(mcap),
-                "AvgVol30": int(avgvol),
-                "RSI14": round(rsi14, 2),
+                "Ticker": t,
+                "Name": name,
+                "AssetType": asset_type,
+                "Price (USD)": round(price, 2),
+                "MarketCap_or_TotalAssets (USD)": int(effective_cap),
+                "Avg Daily Volume": int(avg_vol),
+                "RSI14": round(rsi, 2),
                 "SMA200": round(sma200, 2),
-                "DistanceFromSMA200_%": round(dist, 2),
-                "TrendConfirmed": "Y",
-                "Entry": entry,
-                "StopLoss": stop,
-                "Target": target,
-                "RiskReward": round(float(rr), 2) if not np.isnan(rr) else ""
+                "DistanceFromSMA200 %": round(dist_sma200_pct, 2),
+                "HigherHighsHigherLows": hhhl,
+                "Trend Confirmed (Y/N)": "Y" if trend_confirmed else "N",
+                "Entry (USD)": round(entry, 2),
+                "StopLoss (USD)": round(stop, 2),
+                "Target (USD)": round(target, 2),
+                "Risk/Reward": round(rr, 2),
             })
 
-        except Exception as e:
-            print(f"{tkr} error: {e}")
+        except Exception:
+            continue
 
-    out = pd.DataFrame(rows)
-    if out.empty:
-        msg = "✅ Screener doběhl: žádný ticker nesplnil filtry."
-        send_telegram(msg)
+    df = pd.DataFrame(rows)
+
+    if df.empty:
+        # i když nic nenajde, vytvoří soubor, aby workflow nespadlo
+        df = pd.DataFrame(columns=[
+            "Ticker","Name","AssetType","Price (USD)","MarketCap_or_TotalAssets (USD)","Avg Daily Volume",
+            "RSI14","SMA200","DistanceFromSMA200 %","HigherHighsHigherLows","Trend Confirmed (Y/N)",
+            "Entry (USD)","StopLoss (USD)","Target (USD)","Risk/Reward","Alloc $ (of 10k)","Shares (est.)","Notes"
+        ])
+        df.to_csv("candidates.csv", index=False)
         return
 
-    # Seřazení: blíž k SMA200 + nižší RSI v okně
-    out = out.sort_values(by=["DistanceFromSMA200_%", "RSI14"], ascending=[True, True]).head(MAX_CANDIDATES)
+    # --- vyber maximálně 5 kandidátů ---
+    # řazení: nejdřív “trend confirmed”, pak nejblíž SMA200 (pullback), pak největší cap
+    df["trend_rank"] = (df["Trend Confirmed (Y/N)"] == "Y").astype(int)
+    df["cap_rank"] = df["MarketCap_or_TotalAssets (USD)"]
+    df["abs_dist"] = df["DistanceFromSMA200 %"].abs()
 
-    out.to_csv("candidates.csv", index=False)
+    df = df.sort_values(
+        by=["trend_rank","abs_dist","cap_rank"],
+        ascending=[False, True, False]
+    ).head(5).copy()
 
-    lines = ["📈 TOP kandidáti (Growth+Stability):"]
-    for _, r in out.iterrows():
-        lines.append(f"- {r['Ticker']} | ${r['Price']} | RSI {r['RSI14']} | DistSMA200 {r['DistanceFromSMA200_%']}% | RR {r['RiskReward']}")
-    send_telegram("\n".join(lines))
+    # --- alokace a počty kusů ---
+    n = len(df)
+    alloc_each = BUDGET / n if n else 0
+
+    df["Alloc $ (of 10k)"] = (alloc_each).round(2)
+    df["Shares (est.)"] = df.apply(lambda r: int(math.floor(alloc_each / r["Price (USD)"])) if r["Price (USD)"] > 0 else 0, axis=1)
+
+    df["Notes"] = "Meets: 30–150$, cap/asset≥20B, vol≥1M, >SMA200, RSI 35–55, HH&HL"
+
+    df = df.drop(columns=["trend_rank","cap_rank","abs_dist"], errors="ignore")
+
+    df.to_csv("candidates.csv", index=False)
 
 if __name__ == "__main__":
     main()
