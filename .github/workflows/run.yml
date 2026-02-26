@@ -1,4 +1,4 @@
-name: Run Screener Bot
+name: growth-stability-screener
 
 on:
   workflow_dispatch:
