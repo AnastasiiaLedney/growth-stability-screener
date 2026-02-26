@@ -3,31 +3,31 @@ name: Growth-Stability Screener
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 7 * * 1-5"   # Po–Pá v 07:00 UTC
+    - cron: "0 14 * * 1-5"   # Každý všední den v 14:00 UTC (před otevřením trhů v USA)
 
 jobs:
   run-screener:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: 'pip' # Rychlejší instalace při příštím běhu
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run bot
-        run: |
-          python bot.py
+      - name: Run Screener Bot
+        run: python bot.py
 
-      - name: Upload candidates.csv artifact
+      - name: Upload Results
         uses: actions/upload-artifact@v4
         with:
-          name: candidates
+          name: stock-candidates
           path: candidates.csv
